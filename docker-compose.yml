@@ -1,0 +1,106 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: jobhunter-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-jobhunter}
+      POSTGRES_USER: ${POSTGRES_USER:-jobhunter}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-jobhunter}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/init_db.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-jobhunter} -d ${POSTGRES_DB:-jobhunter}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    container_name: jobhunter-redis
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  worker:
+    build:
+      context: .
+      target: runtime
+    container_name: jobhunter-worker
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      - .:/app
+      - app-logs:/app/logs
+    command: ["celery", "-A", "app.celery_app", "worker", "--loglevel=INFO", "--queues=default", "--hostname=jobhunter-worker@%h"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.celery_app inspect ping --timeout=5 | grep -q pong"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  beat:
+    build:
+      context: .
+      target: runtime
+    container_name: jobhunter-beat
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      - .:/app
+      - app-logs:/app/logs
+      - celerybeat-data:/tmp/celerybeat
+    command: ["celery", "-A", "app.celery_app", "beat", "--loglevel=INFO", "--schedule=/tmp/celerybeat/celerybeat-schedule"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  flower:
+    build:
+      context: .
+      target: runtime
+    container_name: jobhunter-flower
+    env_file:
+      - path: .env
+        required: false
+    ports:
+      - "${FLOWER_PORT:-5555}:5555"
+    command: ["celery", "-A", "app.celery_app", "flower", "--port=5555"]
+    depends_on:
+      redis:
+        condition: service_healthy
+      worker:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:5555/ >/dev/null"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  postgres-data:
+  redis-data:
+  app-logs:
+  celerybeat-data:

@@ -1,0 +1,14 @@
+[project]
+name = "jobhunter-bot"
+version = "1.0.0"
+description = "Daily job scraping, scoring, persistence and alerting bot for Python backend roles."
+requires-python = ">=3.12"
+readme = "README.md"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
