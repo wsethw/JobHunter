@@ -1,0 +1,10 @@
+pytest
+pytest-cov
+pytest-mock
+responses
+freezegun
+ruff
+mypy
+pip-audit
+pre-commit
+testcontainers[postgres]

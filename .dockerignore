@@ -7,6 +7,8 @@ __pycache__
 *.pyd
 logs/*
 !logs/.gitkeep
+exports/*
+!exports/.gitkeep
 postgres-data
 redis-data
 celerybeat-schedule

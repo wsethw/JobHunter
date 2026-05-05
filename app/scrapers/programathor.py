@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import logging
 import re
+from typing import cast
 from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
+from app.parsers import parse_contract_type, parse_location, parse_salary
 from app.scrapers.base import BaseScraper, Job
 
 logger = logging.getLogger(__name__)
@@ -20,7 +22,9 @@ class ProgramathorScraper(BaseScraper):
     base_url = "https://programathor.com.br"
     jobs_url = "https://programathor.com.br/jobs"
 
-    def scrape(self) -> list[Job]:
+    def scrape(
+        self,
+    ) -> list[Job]:  # pragma: no cover - browser orchestration; parser is unit tested
         logger.info("%s scraping started url=%s", self.name, self.jobs_url)
         jobs: list[Job] = []
 
@@ -38,7 +42,11 @@ class ProgramathorScraper(BaseScraper):
             page = context.new_page()
 
             try:
-                page.goto(self.jobs_url, wait_until="domcontentloaded", timeout=self.settings.playwright_timeout_ms)
+                page.goto(
+                    self.jobs_url,
+                    wait_until="domcontentloaded",
+                    timeout=self.settings.playwright_timeout_ms,
+                )
                 page.wait_for_timeout(1500)
                 links = self._collect_job_links(page.content())
                 logger.info("%s collected candidate links=%s", self.name, len(links))
@@ -50,8 +58,10 @@ class ProgramathorScraper(BaseScraper):
                             jobs.append(job)
                     except PlaywrightTimeoutError:
                         logger.warning("%s timeout loading detail link=%s", self.name, link)
+                        self.save_artifact("programathor-timeout", page.content(), suffix=".html")
                     except Exception:
                         logger.exception("%s failed to parse detail link=%s", self.name, link)
+                        self.save_artifact("programathor-error", page.content(), suffix=".html")
             finally:
                 context.close()
                 browser.close()
@@ -65,7 +75,7 @@ class ProgramathorScraper(BaseScraper):
         seen: set[str] = set()
 
         for anchor in soup.select('a[href*="/jobs/"]'):
-            href = anchor.get("href")
+            href = cast(str | None, anchor.get("href"))
             if not href:
                 continue
             absolute = self.canonicalize_url(urljoin(self.base_url, href))
@@ -84,8 +94,9 @@ class ProgramathorScraper(BaseScraper):
         logger.info("%s loading detail link=%s", self.name, link)
         page.goto(link, wait_until="domcontentloaded", timeout=self.settings.playwright_timeout_ms)
         page.wait_for_timeout(1000)
+        return self.parse_detail_html(page.content(), link)
 
-        html = page.content()
+    def parse_detail_html(self, html: str, link: str) -> Job | None:
         soup = BeautifulSoup(html, "html.parser")
         full_text = self.normalize_text(soup.get_text(" "))
 
@@ -96,8 +107,13 @@ class ProgramathorScraper(BaseScraper):
 
         company = self._extract_company(soup, full_text)
         location = self._extract_field(full_text, ["Localização", "Localizacao", "Local"])
-        seniority = self._extract_seniority_from_text(full_text) or self.estimate_seniority(title, full_text)
+        seniority = self._extract_seniority_from_text(full_text) or self.estimate_seniority(
+            title, full_text
+        )
         stack = self._extract_stack_chips(soup) or self.detect_stack(title, full_text)
+        salary = parse_salary(full_text)
+        location_info = parse_location(location, full_text)
+        contract_type = parse_contract_type([full_text])
 
         return self.build_job(
             title=title,
@@ -105,9 +121,18 @@ class ProgramathorScraper(BaseScraper):
             location=location,
             stack=stack,
             link=link,
+            external_id=link.rstrip("/").split("/")[-1],
             published_at=None,
             seniority=seniority,
+            salary_min=salary.salary_min,
+            salary_max=salary.salary_max,
+            salary_currency=salary.salary_currency,
+            contract_type=contract_type,
+            remote_type=location_info.remote_type,
+            country=location_info.country,
+            city=location_info.city,
             description=full_text,
+            raw_payload={"html_parser": "programathor_detail"},
         )
 
     def _first_text(self, soup: BeautifulSoup, selectors: list[str]) -> str | None:
@@ -127,7 +152,7 @@ class ProgramathorScraper(BaseScraper):
     def _extract_company(self, soup: BeautifulSoup, full_text: str) -> str | None:
         image = soup.select_one('img[alt]:not([alt=""])')
         if image and image.get("alt"):
-            alt = self.normalize_text(image["alt"])
+            alt = self.normalize_text(cast(str, image["alt"]))
             if 2 <= len(alt) <= 80 and "programathor" not in alt.lower():
                 return alt[:200]
 
@@ -146,7 +171,7 @@ class ProgramathorScraper(BaseScraper):
 
     def _extract_field(self, text: str, labels: list[str]) -> str | None:
         for label in labels:
-            pattern = rf"{re.escape(label)}\s*:\s*([^|•\n\r]{2,200})"
+            pattern = rf"{re.escape(label)}\s*:\s*([^|•\n\r]{2, 200})"
             match = re.search(pattern, text, flags=re.IGNORECASE)
             if match:
                 return self.normalize_text(match.group(1))[:200]
@@ -164,7 +189,16 @@ class ProgramathorScraper(BaseScraper):
 
     def _extract_stack_chips(self, soup: BeautifulSoup) -> list[str]:
         candidates: list[str] = []
-        for element in soup.select("a, span, li, div"):
+        selectors = [
+            ".tag",
+            ".badge",
+            ".label",
+            "[class*='tag']",
+            "[class*='skill']",
+            "[class*='technology']",
+            "li",
+        ]
+        for element in soup.select(",".join(selectors)):
             text = self.normalize_text(element.get_text(" "))
             if not text or len(text) > 30:
                 continue

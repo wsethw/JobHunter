@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
+import re
 from functools import lru_cache
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
+from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
-from pydantic import AliasChoices, Field, field_validator
+from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 logger = logging.getLogger(__name__)
@@ -24,6 +28,8 @@ DEFAULT_USER_AGENTS = [
 ]
 
 DEFAULT_DESIRED_STACK = "Python,Django,FastAPI,PostgreSQL,Docker,AWS,Celery,Redis,SQLAlchemy"
+VALID_SOURCES = {"github_backendbr", "programathor", "linkedin"}
+SECRET_FIELD_PATTERNS = re.compile("token|password|secret|basic_auth|database_url|redis_url", re.I)
 
 
 class Settings(BaseSettings):
@@ -33,6 +39,7 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
+        populate_by_name=True,
         extra="ignore",
     )
 
@@ -45,6 +52,9 @@ class Settings(BaseSettings):
     schedule_minute: int = Field(default=0, ge=0, le=59)
 
     database_url: str = "postgresql+psycopg://jobhunter:jobhunter@postgres:5432/jobhunter"
+    database_url_test: str = (
+        "postgresql+psycopg://jobhunter:jobhunter@localhost:5432/jobhunter_test"
+    )
     redis_url: str = "redis://redis:6379/0"
 
     sources_raw: str = Field(
@@ -62,14 +72,33 @@ class Settings(BaseSettings):
         default=DEFAULT_DESIRED_STACK,
         validation_alias=AliasChoices("DESIRED_STACK", "desired_stack"),
     )
+    must_have_stack_raw: str = Field(
+        default="Python,PostgreSQL",
+        validation_alias=AliasChoices("MUST_HAVE_STACK", "must_have_stack"),
+    )
+    nice_to_have_stack_raw: str = Field(
+        default="FastAPI,Docker,AWS,Redis,Celery",
+        validation_alias=AliasChoices("NICE_TO_HAVE_STACK", "nice_to_have_stack"),
+    )
+    negative_keywords_raw: str = Field(
+        default="estágio,frontend only,presencial obrigatório",
+        validation_alias=AliasChoices("NEGATIVE_KEYWORDS", "negative_keywords"),
+    )
+    preferred_location_raw: str = Field(
+        default="remote,brazil",
+        validation_alias=AliasChoices("PREFERRED_LOCATION", "preferred_location"),
+    )
     desired_seniority: str = "senior"
-    min_score_to_notify: float = Field(default=1.0, ge=0.0, le=100.0)
+    remote_only: bool = False
+    min_score_to_notify: float = Field(default=50.0, ge=0.0, le=100.0)
 
+    enable_telegram: bool = False
     telegram_bot_token: str | None = Field(
         default=None,
         validation_alias=AliasChoices("TELEGRAM_BOT_TOKEN", "TELEGRAM_TOKEN"),
     )
     telegram_chat_id: str | None = None
+    telegram_parse_mode: str = "HTML"
 
     enable_email: bool = False
     email_host: str | None = None
@@ -84,6 +113,12 @@ class Settings(BaseSettings):
         default=None,
         validation_alias=AliasChoices("USER_AGENTS", "user_agents"),
     )
+    send_empty_report: bool = False
+    scraper_artifacts_dir: str = "logs/artifacts"
+    enable_playwright_tracing: bool = False
+    respect_robots_txt: bool = False
+    scraper_rate_limit_seconds: float = Field(default=1.0, ge=0.0, le=60.0)
+    flower_basic_auth: str | None = None
 
     @field_validator("desired_seniority")
     @classmethod
@@ -93,9 +128,48 @@ class Settings(BaseSettings):
             raise ValueError("DESIRED_SENIORITY must be junior, pleno, senior or any")
         return normalized
 
+    @field_validator("sources_raw")
+    @classmethod
+    def validate_sources(cls, value: str) -> str:
+        sources = parse_list(value)
+        unknown = sorted(set(sources) - VALID_SOURCES)
+        if unknown:
+            raise ValueError(
+                f"Unknown source(s): {', '.join(unknown)}. Valid: {sorted(VALID_SOURCES)}"
+            )
+        if not sources:
+            raise ValueError("At least one source must be configured in SOURCES")
+        return value
+
+    @field_validator("telegram_parse_mode")
+    @classmethod
+    def validate_parse_mode(cls, value: str) -> str:
+        normalized = value.strip()
+        if normalized not in {"HTML", "Markdown", "MarkdownV2"}:
+            raise ValueError("TELEGRAM_PARSE_MODE must be HTML, Markdown or MarkdownV2")
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_notification_settings(self) -> Settings:
+        if self.enable_telegram and not (self.telegram_bot_token and self.telegram_chat_id):
+            raise ValueError(
+                "ENABLE_TELEGRAM=true requires TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID"
+            )
+        if self.enable_email:
+            missing = [
+                name for name in ("email_host", "email_from", "email_to") if not getattr(self, name)
+            ]
+            if missing:
+                raise ValueError(f"ENABLE_EMAIL=true requires: {', '.join(missing)}")
+        return self
+
     @property
     def telegram_enabled(self) -> bool:
-        return bool(self.telegram_bot_token and self.telegram_chat_id)
+        return bool(
+            (self.enable_telegram or self.telegram_bot_token)
+            and self.telegram_bot_token
+            and self.telegram_chat_id
+        )
 
     @property
     def email_enabled(self) -> bool:
@@ -111,9 +185,39 @@ class Settings(BaseSettings):
         return parse_list(self.desired_stack_raw)
 
     @property
+    def must_have_stack(self) -> list[str]:
+        return parse_list(self.must_have_stack_raw)
+
+    @property
+    def nice_to_have_stack(self) -> list[str]:
+        return parse_list(self.nice_to_have_stack_raw)
+
+    @property
+    def negative_keywords(self) -> list[str]:
+        return parse_list(self.negative_keywords_raw)
+
+    @property
+    def preferred_location(self) -> list[str]:
+        return parse_list(self.preferred_location_raw)
+
+    @property
     def user_agents(self) -> list[str]:
         parsed = parse_list(self.user_agents_raw or "")
         return parsed or DEFAULT_USER_AGENTS.copy()
+
+    def redacted_dict(self) -> dict[str, Any]:
+        data = self.model_dump()
+        data.update(
+            {
+                "sources": self.sources,
+                "desired_stack": self.desired_stack,
+                "must_have_stack": self.must_have_stack,
+                "nice_to_have_stack": self.nice_to_have_stack,
+                "negative_keywords": self.negative_keywords,
+                "preferred_location": self.preferred_location,
+            }
+        )
+        return {key: redact_secret(key, value) for key, value in data.items()}
 
 
 def parse_list(value: str) -> list[str]:
@@ -121,10 +225,36 @@ def parse_list(value: str) -> list[str]:
     if not cleaned:
         return []
     if cleaned.startswith("["):
-        import json
-
-        return [str(item).strip() for item in json.loads(cleaned) if str(item).strip()]
+        try:
+            parsed = json.loads(cleaned)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid JSON list: {exc.msg}") from exc
+        if not isinstance(parsed, list):
+            raise ValueError("JSON value must be a list")
+        return [str(item).strip() for item in parsed if str(item).strip()]
     return [item.strip() for item in cleaned.split(",") if item.strip()]
+
+
+def redact_secret(key: str, value: Any) -> Any:
+    if value is None or value == "":
+        return value
+    if not SECRET_FIELD_PATTERNS.search(key):
+        return value
+    if key.lower().endswith("_url") and isinstance(value, str):
+        return redact_url(value)
+    return "***REDACTED***"
+
+
+def redact_url(url: str) -> str:
+    parts = urlsplit(url)
+    if not parts.password and not parts.username:
+        return url
+    host = parts.hostname or ""
+    if parts.port:
+        host = f"{host}:{parts.port}"
+    username = parts.username or "***"
+    redacted_netloc = f"{username}:***@{host}"
+    return urlunsplit((parts.scheme, redacted_netloc, parts.path, parts.query, parts.fragment))
 
 
 def setup_logging(settings: Settings | None = None) -> None:
@@ -165,7 +295,7 @@ def setup_logging(settings: Settings | None = None) -> None:
     file_handler.setLevel(level)
     root.addHandler(file_handler)
 
-    setattr(root, "_jobhunter_logging_configured", True)
+    root.__dict__["_jobhunter_logging_configured"] = True
     logger.info("Logging configured with level=%s log_dir=%s", settings.log_level, log_dir)
 
 

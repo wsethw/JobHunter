@@ -1,6 +1,9 @@
 .env
 logs/*.log
 logs/*.log.*
+exports/*.csv
+exports/*.json
+exports/*.md
 __pycache__/
 *.py[cod]
 .pytest_cache/

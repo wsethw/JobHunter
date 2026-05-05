@@ -10,7 +10,6 @@ services:
       - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
-      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/init_db.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-jobhunter} -d ${POSTGRES_DB:-jobhunter}"]
       interval: 10s
@@ -45,11 +44,10 @@ services:
       - .:/app
       - app-logs:/app/logs
     command: ["celery", "-A", "app.celery_app", "worker", "--loglevel=INFO", "--queues=default", "--hostname=jobhunter-worker@%h"]
+    restart: unless-stopped
     depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
+      migration:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD-SHELL", "celery -A app.celery_app inspect ping --timeout=5 | grep -q pong"]
       interval: 30s
@@ -70,6 +68,22 @@ services:
       - app-logs:/app/logs
       - celerybeat-data:/tmp/celerybeat
     command: ["celery", "-A", "app.celery_app", "beat", "--loglevel=INFO", "--schedule=/tmp/celerybeat/celerybeat-schedule"]
+    restart: unless-stopped
+    depends_on:
+      migration:
+        condition: service_completed_successfully
+
+  migration:
+    build:
+      context: .
+      target: runtime
+    container_name: jobhunter-migration
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      - .:/app
+    command: ["alembic", "upgrade", "head"]
     depends_on:
       postgres:
         condition: service_healthy
@@ -86,7 +100,8 @@ services:
         required: false
     ports:
       - "${FLOWER_PORT:-5555}:5555"
-    command: ["celery", "-A", "app.celery_app", "flower", "--port=5555"]
+    command: ["sh", "-c", "if [ -n \"$$FLOWER_BASIC_AUTH\" ]; then celery -A app.celery_app flower --port=5555 --basic_auth=\"$$FLOWER_BASIC_AUTH\"; else celery -A app.celery_app flower --port=5555; fi"]
+    restart: unless-stopped
     depends_on:
       redis:
         condition: service_healthy
@@ -94,6 +109,28 @@ services:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:5555/ >/dev/null"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  api:
+    build:
+      context: .
+      target: runtime
+    container_name: jobhunter-api
+    env_file:
+      - path: .env
+        required: false
+    ports:
+      - "${API_PORT:-8000}:8000"
+    command: ["uvicorn", "app.api.main:app", "--host=0.0.0.0", "--port=8000"]
+    restart: unless-stopped
+    depends_on:
+      migration:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/health >/dev/null"]
       interval: 30s
       timeout: 10s
       retries: 3

@@ -4,7 +4,9 @@ import logging
 import random
 import re
 from abc import ABC, abstractmethod
-from datetime import datetime
+from datetime import UTC, datetime
+from decimal import Decimal
+from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
@@ -74,8 +76,17 @@ class Job(BaseModel):
     stack: list[str] = Field(default_factory=list)
     link: str = Field(min_length=8, max_length=500)
     source: str = Field(min_length=2, max_length=100)
+    external_id: str | None = Field(default=None, max_length=200)
     published_at: datetime | None = None
     seniority: str | None = Field(default=None, max_length=50)
+    salary_min: Decimal | None = None
+    salary_max: Decimal | None = None
+    salary_currency: str | None = Field(default=None, max_length=10)
+    contract_type: str | None = Field(default=None, max_length=50)
+    remote_type: str | None = Field(default=None, max_length=50)
+    country: str | None = Field(default=None, max_length=100)
+    city: str | None = Field(default=None, max_length=120)
+    raw_payload: dict[str, Any] = Field(default_factory=dict, exclude=True)
     description: str | None = Field(default=None, exclude=True)
 
     @field_validator("link")
@@ -119,6 +130,19 @@ class BaseScraper(ABC):
         user_agent = random.choice(self.settings.user_agents)
         logger.debug("%s selected user-agent=%s", self.name, user_agent)
         return user_agent
+
+    def save_artifact(self, name: str, content: str | bytes, suffix: str = ".html") -> Path:
+        artifact_dir = Path(self.settings.scraper_artifacts_dir)
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        safe_name = re.sub(r"[^a-zA-Z0-9_.-]+", "-", name).strip("-") or "artifact"
+        timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        path = artifact_dir / f"{self.name}-{safe_name}-{timestamp}{suffix}"
+        if isinstance(content, bytes):
+            path.write_bytes(content)
+        else:
+            path.write_text(content, encoding="utf-8")
+        logger.info("%s saved scraper artifact path=%s", self.name, path)
+        return path
 
     def canonicalize_url(self, url: str) -> str:
         """Normalize URLs enough to support deterministic link deduplication."""
@@ -193,7 +217,7 @@ class BaseScraper(ABC):
                 positions[seniority] = min(index for index in indexes if index >= 0)
         if not positions:
             return None
-        estimated = min(positions, key=positions.get)
+        estimated = min(positions, key=lambda key: positions[key])
         logger.debug("%s estimated seniority=%s", self.name, estimated)
         return estimated
 
@@ -209,6 +233,15 @@ class BaseScraper(ABC):
         seniority: str | None = None,
         description: str | None = None,
         extra_text: str | None = None,
+        external_id: str | None = None,
+        salary_min: Decimal | None = None,
+        salary_max: Decimal | None = None,
+        salary_currency: str | None = None,
+        contract_type: str | None = None,
+        remote_type: str | None = None,
+        country: str | None = None,
+        city: str | None = None,
+        raw_payload: dict[str, Any] | None = None,
     ) -> Job:
         normalized_title = self.normalize_text(title)
         normalized_company = self.normalize_text(company) or None
@@ -224,8 +257,17 @@ class BaseScraper(ABC):
             stack=detected_stack,
             link=self.canonicalize_url(link),
             source=self.name,
+            external_id=external_id,
             published_at=published_at,
             seniority=estimated_seniority,
+            salary_min=salary_min,
+            salary_max=salary_max,
+            salary_currency=salary_currency,
+            contract_type=contract_type,
+            remote_type=remote_type,
+            country=country,
+            city=city,
+            raw_payload=raw_payload or {},
             description=normalized_description,
         )
         logger.info(
@@ -240,9 +282,7 @@ class BaseScraper(ABC):
 
     def _contains_term(self, text: str, term: str) -> bool:
         escaped = re.escape(term).replace("\\ ", r"\s+")
-        if re.search(rf"(?<![\w+#.]){escaped}(?![\w+#.])", text, flags=re.IGNORECASE):
-            return True
-        return False
+        return bool(re.search(rf"(?<![\w+#.]){escaped}(?![\w+#.])", text, flags=re.IGNORECASE))
 
     def _display_technology(self, canonical: str) -> str:
         preferred = {

@@ -10,6 +10,7 @@ from requests import Response
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from app.config import Settings
+from app.exceptions import ScraperError
 from app.scrapers.base import BaseScraper, Job
 
 logger = logging.getLogger(__name__)
@@ -25,7 +26,9 @@ class GitHubBackendBRScraper(BaseScraper):
         super().__init__(settings)
         self.session = requests.Session()
 
-    def scrape(self) -> list[Job]:
+    def scrape(
+        self,
+    ) -> list[Job]:  # pragma: no cover - network orchestration; parser is unit tested
         logger.info("%s scraping started", self.name)
         since = datetime.now(UTC) - timedelta(days=self.settings.github_since_days)
         headers = {
@@ -38,6 +41,7 @@ class GitHubBackendBRScraper(BaseScraper):
 
         jobs: list[Job] = []
         page = 1
+        next_url: str | None = self.api_url
         while len(jobs) < self.settings.max_jobs_per_source:
             params = {
                 "state": "open",
@@ -47,7 +51,11 @@ class GitHubBackendBRScraper(BaseScraper):
                 "sort": "created",
                 "direction": "desc",
             }
-            response = self._get(self.api_url, headers=headers, params=params)
+            response = self._get(
+                next_url or self.api_url,
+                headers=headers,
+                params=params if next_url == self.api_url else None,
+            )
             issues = response.json()
             if not issues:
                 logger.info("%s no more GitHub issues found at page=%s", self.name, page)
@@ -59,12 +67,15 @@ class GitHubBackendBRScraper(BaseScraper):
                 try:
                     jobs.append(self._issue_to_job(issue))
                 except Exception:
-                    logger.exception("%s failed to normalize issue id=%s", self.name, issue.get("id"))
+                    logger.exception(
+                        "%s failed to normalize issue id=%s", self.name, issue.get("id")
+                    )
                 if len(jobs) >= self.settings.max_jobs_per_source:
                     break
 
             page += 1
-            if page > 3:
+            next_url = self._next_link(response.headers.get("Link"))
+            if not next_url or page > 3:
                 logger.info("%s reached pagination safety limit", self.name)
                 break
 
@@ -79,18 +90,26 @@ class GitHubBackendBRScraper(BaseScraper):
     )
     def _get(self, url: str, **kwargs: Any) -> Response:
         response = self.session.get(url, timeout=30, **kwargs)
+        remaining = response.headers.get("X-RateLimit-Remaining")
+        logger.debug(
+            "%s GitHub API status=%s remaining=%s", self.name, response.status_code, remaining
+        )
+        if response.status_code in {403, 429}:
+            reset = response.headers.get("X-RateLimit-Reset")
+            raise ScraperError(
+                f"GitHub rate limit or access block status={response.status_code} remaining={remaining} reset={reset}"
+            )
         if response.status_code >= 500:
             raise RuntimeError(f"GitHub API transient error status={response.status_code}")
         response.raise_for_status()
-        remaining = response.headers.get("X-RateLimit-Remaining")
-        logger.debug("%s GitHub API status=%s remaining=%s", self.name, response.status_code, remaining)
         return response
 
     def _issue_to_job(self, issue: dict[str, Any]) -> Job:
         title = issue.get("title") or "Sem título"
         body = issue.get("body") or ""
         html_url = issue["html_url"]
-        labels = " ".join(label.get("name", "") for label in issue.get("labels", []))
+        labels_data = issue.get("labels", [])
+        labels = " ".join(label.get("name", "") for label in labels_data)
 
         company = self._parse_company(title, body)
         location = self._parse_location(title, body, labels)
@@ -104,11 +123,31 @@ class GitHubBackendBRScraper(BaseScraper):
             location=location,
             stack=stack,
             link=html_url,
+            external_id=str(issue.get("number") or issue.get("id") or ""),
             published_at=published_at,
             seniority=seniority,
             description=body,
             extra_text=labels,
+            raw_payload={
+                "issue_number": issue.get("number"),
+                "id": issue.get("id"),
+                "labels": labels_data,
+                "state": issue.get("state"),
+                "comments": issue.get("comments"),
+                "updated_at": issue.get("updated_at"),
+            },
         )
+
+    def _next_link(self, header: str | None) -> str | None:
+        if not header:
+            return None
+        for chunk in header.split(","):
+            if 'rel="next"' not in chunk:
+                continue
+            match = re.search(r"<([^>]+)>", chunk)
+            if match:
+                return match.group(1)
+        return None
 
     def _parse_company(self, title: str, body: str) -> str | None:
         title_match = re.search(r"@\s*([^\]\)\|/-][\wÀ-ÿ0-9 .,&+-]{2,80})", title)

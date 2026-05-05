@@ -1,0 +1,14 @@
+services:
+  postgres:
+    ports: []
+
+  redis:
+    ports: []
+
+  flower:
+    environment:
+      FLOWER_BASIC_AUTH: "change-me:change-me"
+
+  api:
+    ports:
+      - "8000:8000"
